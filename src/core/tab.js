@@ -10,6 +10,7 @@
  * (Approach from issue #155 and PR #163, verified on Desktop 3.1.0.)
  */
 import CDP from 'chrome-remote-interface';
+import { labelsFor } from './i18n.js';
 import { getClient, reconnectTo, CDP_HOST, CDP_PORT } from '../connection.js';
 
 /**
@@ -87,7 +88,11 @@ async function isTargetVisible(targetId) {
 async function findLandingTarget() {
   const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
   const targets = await resp.json();
-  return targets.find(t => t.type === 'page' && t.title === 'New tab') || null;
+  // Match on the landing page's URL, not its title: the title is localized
+  // (zh: "新标签页"), so a title comparison only ever works in English.
+  return targets.find(t => t.type === 'page' && /\/app\/new-tab\//i.test(t.url || ''))
+    || targets.find(t => t.type === 'page' && t.title === 'New tab')
+    || null;
 }
 
 /** Run fn with an eval helper attached to a specific target. */
@@ -120,7 +125,12 @@ export async function newTab({ layout, name } = {}) {
       const before = await evalIn(`document.querySelectorAll('.tabs-container .tab').length`);
       const clicked = await evalIn(`
         (function() {
-          var btn = document.querySelector('[class*="create-new-tab"]');
+          // The real button (.create-new-tab-button) has to be tried first:
+          // [class*="create-new-tab"] matches the wrapping
+          // .create-new-tab-button-container earlier in document order, and
+          // clicking that container does nothing.
+          var btn = document.querySelector('.create-new-tab-button')
+            || document.querySelector('[class*="create-new-tab"]');
           if (!btn) return false;
           btn.click();
           return true;
@@ -158,6 +168,13 @@ export async function newTab({ layout, name } = {}) {
   const layoutName = name || 'New layout';
   const picked = await withTarget(landing.id, async (evalIn) => {
     if (wantNew) {
+      // The landing page renders in the app's language, so the name field's
+      // placeholder and the Create button's text are both translated. Resolve
+      // them through the app's own locale bundle instead of assuming English.
+      const language = await evalIn('navigator.language');
+      const namePlaceholders = labelsFor('My layout', language);
+      const createLabels = labelsFor('Create', language).map(l => l.toLowerCase());
+
       // "Create new layout" opens a naming dialog; the Create button stays
       // disabled until the name input is filled (React controlled input, so
       // the native value setter + input event are required).
@@ -165,12 +182,15 @@ export async function newTab({ layout, name } = {}) {
       await new Promise(r => setTimeout(r, 700));
       const filled = await evalIn(`
         (function() {
-          // The dialog's name field (not the landing page's Search box).
-          var inp = document.querySelector('input[placeholder="My layout"]');
-          if (!inp) {
-            var dlg = document.querySelector('[class*="dialog"], [role="dialog"]');
-            if (dlg) inp = dlg.querySelector('input');
-          }
+          // The dialog's name field, not the landing page's Search box. This
+          // page has no [role="dialog"]/[class*="dialog"] wrapper to scope to,
+          // so match the placeholder, then fall back to the last visible text
+          // input — the one the dialog just added.
+          var wanted = ${JSON.stringify(namePlaceholders)};
+          var inputs = Array.prototype.slice.call(document.querySelectorAll('input'))
+            .filter(function(e) { return e.offsetParent !== null; });
+          var inp = inputs.filter(function(e) { return wanted.indexOf(e.placeholder) !== -1; })[0]
+            || inputs[inputs.length - 1];
           if (!inp) return 'no-dialog-input';
           var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
           setter.call(inp, ${JSON.stringify(name || 'New layout')});
@@ -182,11 +202,11 @@ export async function newTab({ layout, name } = {}) {
       await new Promise(r => setTimeout(r, 400));
       const created = await evalIn(`
         (function() {
-          var scope = document.querySelector('[class*="dialog"], [role="dialog"]') || document;
-          var btns = scope.querySelectorAll('button');
+          var wanted = ${JSON.stringify(createLabels)};
+          var btns = document.querySelectorAll('button');
           for (var i = 0; i < btns.length; i++) {
             var t = (btns[i].textContent || '').trim().toLowerCase();
-            if (t === 'create' && !btns[i].disabled) { btns[i].click(); return true; }
+            if (wanted.indexOf(t) !== -1 && !btns[i].disabled) { btns[i].click(); return true; }
           }
           return false;
         })()

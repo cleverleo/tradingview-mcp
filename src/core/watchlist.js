@@ -10,7 +10,11 @@ import { evaluate, evaluateAsync, getClient } from '../connection.js';
 // TV renamed the right-rail button: current builds use data-name="base" with
 // aria-label "Watchlist, details, and news"; older builds used
 // data-name="base-watchlist-widget-button" / aria-label "Watchlist".
+// The aria-label is localized (zh: "自选表、详情和新闻"), so the data-name
+// attributes have to be tried first — matching the English label alone leaves
+// every non-English install unable to find the button at all.
 const WL_BUTTON_JS = `(document.querySelector('[data-name="base-watchlist-widget-button"]')
+  || document.querySelector('[data-name="base"]')
   || document.querySelector('[aria-label="Watchlist, details, and news"]')
   || document.querySelector('[aria-label^="Watchlist"]'))`;
 
