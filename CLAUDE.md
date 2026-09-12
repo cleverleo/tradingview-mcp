@@ -1,6 +1,6 @@
 # TradingView MCP — Claude Instructions
 
-84 tools for reading and controlling a live TradingView Desktop chart via CDP (port 9222).
+88 tools for reading and controlling a live TradingView Desktop chart via CDP (port 9222).
 
 ## Decision Tree — Which Tool When
 
@@ -73,6 +73,26 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 - `alert_list` → view active alerts
 - `alert_delete` → remove alerts
 
+### "Do this without disturbing the chart the user is watching"
+Several read tools touch the interface to get their data — the strategy tools open the Strategy Tester panel (and unhide a hidden strategy), `watchlist_get` opens the right rail, `pine_get_*` opens the Pine editor, `batch_run` switches the symbol. Put that in a second window instead:
+
+1. `window_open` → opens a window on the layout picker; returns `target_id` (the picker) and `previous_target_id` (the chart the user is on)
+2. `layout_new` with the picker pinned → gives the window its own layout, and returns a **new** `target_id` (the picker navigates to a chart, so the old id is gone)
+3. do the work with that `target_id` pinned
+4. `window_close` when done, and `layout_delete` if the scratch layout is no longer wanted
+
+Pinning is the `TV_TARGET_ID` env var on the server process. **With two windows open, always pin**: unpinned calls attach to whichever chart target `/json/list` returns first, which can be either window.
+
+A window isolates the *interface*, not account content — layouts, watchlists, alerts and Pine scripts are account-level and shared by every window.
+
+- `window_list` → open windows, their tabs, and the target ids worth pinning to
+
+### "Manage layouts"
+- `layout_list` → saved layouts with both ids: `id` (numeric, for delete) and `chart_id` (the short one in the URL)
+- `layout_switch` → load one by name or id
+- `layout_new` → create a named blank layout in a new tab
+- `layout_delete` → **permanently** remove a saved layout; requires both its numeric id and its exact name, which must agree
+
 ### "Navigate the UI"
 - `ui_open_panel` → open/close pine-editor, strategy-tester, watchlist, alerts, trading
 - `ui_click` → click buttons by aria-label, text, or data-name
@@ -117,6 +137,8 @@ These tools can return large payloads. Follow these rules to avoid context bloat
 - Pine indicators must be **visible** on chart for pine graphics tools to read their data
 - `chart_manage_indicator` requires **full indicator names**: "Relative Strength Index" not "RSI", "Moving Average Exponential" not "EMA", "Bollinger Bands" not "BB"
 - Screenshots save to `screenshots/` directory with timestamps
+- `TV_TARGET_ID` pins every CDP connection to one page target; without it the server attaches to the first chart target `/json/list` reports
+- Deleting is not undoable: `layout_delete` takes an id *and* a name and aborts if they disagree
 - OHLCV capped at 500 bars, trades at 20 per request
 - Pine labels capped at 50 per study by default (pass `max_labels` to override)
 

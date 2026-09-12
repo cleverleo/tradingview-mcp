@@ -160,6 +160,12 @@ export async function open({ wait_ms, _deps } = {}) {
 
   const before = await pageTargets(getTargets);
   const beforeIds = new Set(before.map((t) => t.id));
+  // The chart page an unpinned call would have reached before this window
+  // existed — i.e. the one the user is looking at. Opening a second window
+  // makes the unpinned default ambiguous (verified: the new window can sort
+  // first in /json/list and win), so hand this back for pinning reads at the
+  // original window and for restoring the default afterwards.
+  const previousChart = before.find((t) => kindOf(t.url) === 'chart') || null;
   const shells = before.filter((t) => kindOf(t.url) === 'shell');
   if (!shells.length) {
     throw new Error('TradingView shell window not found. Is this TradingView Desktop with tabs?');
@@ -233,10 +239,11 @@ export async function open({ wait_ms, _deps } = {}) {
     new_shell_target_id: newShell?.id || null,
     target_id: newPage?.id || null,
     target_kind: newPage ? kindOf(newPage.url) : null,
+    previous_target_id: previousChart?.id || null,
     new_targets: fresh.map((t) => ({ target_id: t.id, kind: kindOf(t.url) })),
     note: newPage && kindOf(newPage.url) === 'landing'
-      ? 'New window is on the layout picker. Give it its own layout with TV_TARGET_ID=<target_id> layout_new, then keep using that TV_TARGET_ID for everything else.'
-      : 'Use TV_TARGET_ID=<target_id> to pin other tools to this window.',
+      ? 'New window is on the layout picker. Give it its own layout with TV_TARGET_ID=<target_id> layout_new — that call returns a NEW target_id (the picker navigates to a chart), which is the one to pin from then on. previous_target_id is the user\'s chart page; pin reads to it when you need the original window. With two windows open, ALWAYS pass TV_TARGET_ID: the unpinned default is ambiguous.'
+      : 'Use TV_TARGET_ID=<target_id> to pin other tools to this window. previous_target_id is the chart page an unpinned call reached before this window existed.',
   };
 }
 

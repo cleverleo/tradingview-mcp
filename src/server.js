@@ -23,7 +23,7 @@ const server = new McpServer(
     description: 'AI-assisted TradingView chart analysis and Pine Script development via Chrome DevTools Protocol',
   },
   {
-    instructions: `TradingView MCP — 87 tools for reading and controlling a live TradingView Desktop chart.
+    instructions: `TradingView MCP — 88 tools for reading and controlling a live TradingView Desktop chart.
 
 TOOL SELECTION GUIDE — use this to pick the right tool:
 
@@ -63,6 +63,8 @@ Tabs: tab_list, tab_new, tab_close, tab_switch
 Windows: window_list, window_open, window_close
 - window_open gives you a second window so panel/symbol changes stay out of the one the user watches; pin later calls to it with the TV_TARGET_ID env var
 - a window isolates the interface only — layouts, watchlists, alerts and Pine scripts are account-level and shared, so give a scratch window its own layout (layout_new) before changing layout content
+- layout_new / tab_new return the chart page's new target_id: the layout picker navigates to a chart, so the id you pinned is replaced — pin the returned one from then on
+- layout_delete removes a saved layout for good and needs both its id and its exact name from layout_list
 
 CONTEXT MANAGEMENT:
 - ALWAYS use summary=true on data_get_ohlcv

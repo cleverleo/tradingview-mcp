@@ -143,6 +143,35 @@ describe('open', () => {
     assert.match(res.note, /layout_new/);
   });
 
+  it('also reports the chart page an unpinned call would have reached', async () => {
+    const { deps } = openDeps();
+    const res = await open({ wait_ms: 30, _deps: deps });
+    // Opening a window makes the unpinned default ambiguous, so the caller
+    // needs the id of the window the user was already looking at.
+    assert.equal(res.previous_target_id, 'chart1');
+  });
+
+  it('reports previous_target_id as null when no chart was open', async () => {
+    const before = [page('shell1', SHELL_URL)];
+    const after = [...before, page('shell2', SHELL_URL), page('landing2', LANDING_URL)];
+    let calls = 0;
+    const pages = {
+      shell1: {
+        evalIn: evalBy({
+          '.tabs-container': true,
+          'navigator.language': 'en-US',
+          '.action-button': { x: 10, y: 10, title: 'Open new window' },
+        }),
+      },
+    };
+    const res = await open({ wait_ms: 30, _deps: {
+      fetchTargets: async () => (calls++ === 0 ? before : after),
+      withPage: mockWithPage(pages),
+      sleep: async () => {},
+    } });
+    assert.equal(res.previous_target_id, null);
+  });
+
   it('finds the button by a localized title', async () => {
     const { deps } = openDeps({ buttonTitle: '打开新窗口' });
     const res = await open({ wait_ms: 30, _deps: deps });

@@ -116,7 +116,7 @@ export async function layoutList() {
       try {
         window.TradingViewApi.getSavedCharts(function(charts) {
           if (!charts || !Array.isArray(charts)) { resolve({layouts: [], source: 'internal_api', error: 'getSavedCharts returned no data'}); return; }
-          var result = charts.map(function(c) { return { id: c.id || c.chartId || null, name: c.name || c.title || 'Untitled', symbol: c.symbol || null, resolution: c.resolution || null, modified: c.timestamp || c.modified || null }; });
+          var result = charts.map(function(c) { return { id: c.id || c.chartId || null, chart_id: c.url || c.image_url || null, name: c.name || c.title || 'Untitled', symbol: c.symbol || null, resolution: c.resolution || null, modified: c.timestamp || c.modified || null }; });
           resolve({layouts: result, source: 'internal_api'});
         });
         setTimeout(function() { resolve({layouts: [], source: 'internal_api', error: 'getSavedCharts timed out'}); }, 5000);
@@ -167,6 +167,122 @@ export async function layoutSwitch({ name }) {
 
   if (dismissed) await new Promise(r => setTimeout(r, 1000));
   return { success: true, layout: result.name || name, layout_id: result.id, source: result.source, action: 'switched', unsaved_dialog_dismissed: dismissed };
+}
+
+/**
+ * Delete a saved layout from the account.
+ *
+ * This removes content from TradingView's servers and cannot be undone, so
+ * the repo's rule for delete operations — read the list first and check that
+ * the id AND the name both line up — is enforced here rather than left to the
+ * caller: both are required, they must point at the same layout, and a
+ * mismatch aborts without deleting anything. Deleting the layout the pinned
+ * window currently has open is refused too; switch away first. That check
+ * only sees the window this call is attached to, so it will not catch a
+ * layout open in some OTHER window.
+ *
+ * `layout_id` takes either id layout_list reports: the numeric `id` or the
+ * short `chart_id`. The delete endpoint itself wants the short one as a
+ * string — handing it the number comes back
+ * `400 invalid_data {"uid.0":["Expected string."]}` — so the numeric id is
+ * resolved to the short one here.
+ */
+export async function layoutDelete({ layout_id, name, _deps } = {}) {
+  const evalAsync = _deps?.evaluateAsync || evaluateAsync;
+  if (layout_id === undefined || layout_id === null || String(layout_id).trim() === '') {
+    throw new Error('layout_id is required (the numeric id or the short chart_id from layout_list).');
+  }
+  if (name === undefined || name === null || String(name).trim() === '') {
+    throw new Error('name is required as a cross-check: pass the layout name exactly as layout_list reports it, so an id typo cannot delete the wrong layout.');
+  }
+
+  const result = await evalAsync(`
+    new Promise(function(resolve) {
+      var api = window.TradingViewApi;
+      var wantId = ${JSON.stringify(String(layout_id).trim())};
+      var wantName = ${JSON.stringify(String(name))};
+      var listed = false;
+      try {
+        api.getSavedCharts(function(charts) {
+          listed = true;
+          if (!charts || !Array.isArray(charts)) { resolve({ error: 'getSavedCharts returned no data' }); return; }
+          var match = null;
+          for (var i = 0; i < charts.length; i++) {
+            var c = charts[i];
+            if (String(c.id) === wantId || String(c.url || '') === wantId) { match = c; break; }
+          }
+          if (!match) {
+            resolve({ error: 'No layout with id ' + wantId + '.', available: charts.map(function(x) { return { id: x.id, name: x.name }; }) });
+            return;
+          }
+          if (match.name !== wantName) {
+            resolve({ error: 'Refusing to delete: id ' + wantId + ' is "' + match.name + '", but name was given as "' + wantName + '". Re-read layout_list.' });
+            return;
+          }
+          var current = null;
+          try { current = api.layoutId(); } catch (e) {}
+          if (current && match.url === current) {
+            resolve({ error: 'Layout "' + match.name + '" is the one open in this window. Switch away first (layout_switch), or delete it from another window.' });
+            return;
+          }
+          var uid = match.url || null;
+          if (!uid) {
+            resolve({ error: 'Layout "' + match.name + '" has no chart_id, so there is nothing to address the delete endpoint with.' });
+            return;
+          }
+          var info = { id: match.id, name: match.name, chart_id: uid };
+          var before = charts.length;
+          api.removeChartFromServer(uid).then(function() {
+            api.getSavedCharts(function(after) {
+              var list = after || [];
+              var gone = true;
+              for (var j = 0; j < list.length; j++) { if (String(list[j].id) === String(info.id)) { gone = false; break; } }
+              resolve({ deleted: info, gone: gone, layouts_before: before, layouts_after: list.length });
+            });
+            // Deleted, but the re-listing hung: report it as unconfirmed
+            // rather than as a failure — the layout is most likely gone.
+            setTimeout(function() { resolve({ deleted: info, gone: null, layouts_before: before }); }, 5000);
+          }).catch(function(r) {
+            // The backend rejects with the Response itself, so the status and
+            // body are the only useful diagnostics; a bare rejection here used
+            // to surface as a misleading "getSavedCharts timed out".
+            var msg = 'TradingView rejected the delete';
+            if (r && typeof r.status === 'number') {
+              msg += ' (HTTP ' + r.status + ')';
+              if (typeof r.text === 'function') {
+                r.text().then(
+                  function(t) { resolve({ error: msg + ': ' + String(t).slice(0, 200) }); },
+                  function() { resolve({ error: msg }); }
+                );
+                return;
+              }
+            }
+            resolve({ error: msg + ': ' + String((r && r.message) || r) });
+          });
+        });
+      } catch (e) { resolve({ error: e.message }); }
+      setTimeout(function() { if (!listed) resolve({ error: 'getSavedCharts timed out' }); }, 5000);
+      setTimeout(function() { resolve({ error: 'delete did not come back in 20s' }); }, 20000);
+    })
+  `);
+
+  if (result?.error) {
+    const err = new Error(result.error);
+    if (result.available) err.message += ' Available: ' + result.available.map(a => `${a.id} (${a.name})`).join(', ');
+    throw err;
+  }
+
+  const gone = result?.gone;
+  return {
+    success: gone !== false,
+    action: 'layout_deleted',
+    deleted: result?.deleted,
+    verified: gone === true,
+    layouts_before: result?.layouts_before,
+    ...(gone === true ? { layouts_after: result?.layouts_after } : {}),
+    ...(gone === null ? { note: 'Delete was accepted but re-listing the layouts timed out — run layout_list to confirm.' } : {}),
+    ...(gone === false ? { error: 'Delete was accepted but the layout is still listed. Re-read layout_list.' } : {}),
+  };
 }
 
 export async function keyboard({ key, modifiers }) {

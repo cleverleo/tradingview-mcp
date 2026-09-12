@@ -24,6 +24,14 @@ export function registerUiTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  server.tool('layout_delete', 'Permanently delete a saved chart layout from the account. Requires BOTH the numeric id and the exact name from layout_list — they must point at the same layout or the call aborts. Cannot be undone.', {
+    layout_id: z.coerce.string().describe('Layout id from layout_list — either the numeric `id` or the short `chart_id`'),
+    name: z.string().describe('Exact layout name as layout_list reports it — cross-check so an id typo cannot delete the wrong layout'),
+  }, async ({ layout_id, name }) => {
+    try { return jsonResult(await core.layoutDelete({ layout_id, name })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   server.tool('layout_list', 'List saved chart layouts', {}, async () => {
     try { return jsonResult(await core.layoutList()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }

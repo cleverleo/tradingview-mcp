@@ -11,7 +11,7 @@
  */
 import CDP from 'chrome-remote-interface';
 import { labelsFor } from './i18n.js';
-import { getClient, reconnectTo, CDP_HOST, CDP_PORT } from '../connection.js';
+import { getClient, reconnectTo, CDP_HOST, CDP_PORT, PINNED_TARGET_ID } from '../connection.js';
 
 /**
  * List all open chart tabs (CDP page targets).
@@ -84,12 +84,25 @@ async function isTargetVisible(targetId) {
   }
 }
 
-/** Find an open new-tab landing page target (shows the layout picker). */
-async function findLandingTarget() {
+/**
+ * Find an open new-tab landing page target (shows the layout picker).
+ *
+ * With a second window open there can be several landing pages, and taking
+ * the first one means building the layout in the wrong window. TV_TARGET_ID —
+ * which is exactly what window_open hands back — settles it; the scan is the
+ * fallback for the single-window case.
+ */
+export async function findLandingTarget() {
   const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
   const targets = await resp.json();
   // Match on the landing page's URL, not its title: the title is localized
   // (zh: "新标签页"), so a title comparison only ever works in English.
+  const isLanding = (t) => t.type === 'page'
+    && (/\/app\/new-tab\//i.test(t.url || '') || t.title === 'New tab');
+  if (PINNED_TARGET_ID) {
+    const pinned = targets.find(t => t.id === PINNED_TARGET_ID && isLanding(t));
+    if (pinned) return pinned;
+  }
   return targets.find(t => t.type === 'page' && /\/app\/new-tab\//i.test(t.url || ''))
     || targets.find(t => t.type === 'page' && t.title === 'New tab')
     || null;
@@ -149,7 +162,8 @@ export async function newTab({ layout, name } = {}) {
     return {
       success: shellCounts ? shellCounts.after > shellCounts.before : !!landing,
       action: 'new_tab_opened',
-      note: 'Tab is on the layout picker. Call tab_new with layout: "new" or a saved layout name to open a chart in it.',
+      target_id: landing?.id || null,
+      note: 'Tab is on the layout picker. Call tab_new with layout: "new" or a saved layout name to open a chart in it — pin it with TV_TARGET_ID=<target_id> so the layout lands in this tab.',
       ...state,
     };
   }
@@ -258,11 +272,16 @@ export async function newTab({ layout, name } = {}) {
   // Give the chart a moment to boot, then follow it.
   await new Promise(r => setTimeout(r, 2000));
   await reconnectTo(chartTarget.id);
+  // The landing page navigated to a chart, which swapped renderer processes:
+  // the target id the caller pinned is gone and this is its replacement. Hand
+  // it back so the next call can pin to it without re-listing the windows.
   return {
     success: true,
     action: wantNew ? 'new_layout_created' : 'layout_opened_in_new_tab',
     layout: picked,
+    target_id: chartTarget.id,
     chart_id: chartTarget.url.match(/\/chart\/([^/?]+)/)?.[1] || null,
+    note: 'target_id replaces the layout-picker target you pinned — use TV_TARGET_ID=<target_id> from here on.',
   };
 }
 
