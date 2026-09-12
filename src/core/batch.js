@@ -1,8 +1,9 @@
 /**
  * Core batch execution logic.
  */
-import { evaluate, evaluateAsync, getClient, getChartApi, getChartCollection, safeString } from '../connection.js';
-import { waitForChartReady } from '../wait.js';
+import { evaluate as _evaluate, getClient as _getClient, getChartApi as _getChartApi, getChartCollection as _getChartCollection, safeString } from '../connection.js';
+import { getOhlcv as _getOhlcv } from './data.js';
+import { waitForChartReady as _waitForChartReady } from '../wait.js';
 import { writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -10,9 +11,30 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCREENSHOT_DIR = join(dirname(dirname(__dirname)), 'screenshots');
 
-export async function batchRun({ symbols, timeframes, action, delay_ms, ohlcv_count }) {
+const ACTIONS = ['screenshot', 'get_ohlcv', 'get_strategy_results'];
+
+function _resolve(deps) {
+  return {
+    evaluate: deps?.evaluate || _evaluate,
+    getClient: deps?.getClient || _getClient,
+    getChartApi: deps?.getChartApi || _getChartApi,
+    getChartCollection: deps?.getChartCollection || _getChartCollection,
+    waitForChartReady: deps?.waitForChartReady || _waitForChartReady,
+    getOhlcv: deps?.getOhlcv || _getOhlcv,
+  };
+}
+
+export async function batchRun({ symbols, timeframes, action, delay_ms, ohlcv_count, _deps }) {
+  const { evaluate, getClient, getChartApi, getChartCollection, waitForChartReady, getOhlcv } = _resolve(_deps);
+
+  // Validate before touching the chart: an unrecognised action used to switch
+  // the symbol once per iteration and only then report the problem.
+  if (!ACTIONS.includes(action)) {
+    throw new Error(`Unknown action: ${action}. Expected one of: ${ACTIONS.join(', ')}`);
+  }
+
   const tfs = timeframes && timeframes.length > 0 ? timeframes : [null];
-  const delay = delay_ms || 2000;
+  const delay = delay_ms ?? 2000; // `||` here made delay_ms: 0 unreachable
   const results = [];
 
   let colPath, apiPath;
@@ -44,17 +66,12 @@ export async function batchRun({ symbols, timeframes, action, delay_ms, ohlcv_co
           const filePath = join(SCREENSHOT_DIR, fname);
           writeFileSync(filePath, Buffer.from(data, 'base64'));
           actionResult = { file_path: filePath };
-        } else if (action === 'get_ohlcv' && apiPath) {
-          const limit = Math.min(ohlcv_count || 100, 500);
-          actionResult = await evaluateAsync(`
-            new Promise(function(resolve, reject) {
-              ${apiPath}.exportData({ includeTime: true, includeSeries: true, includeStudies: false })
-                .then(function(result) {
-                  var bars = (result.data || []).slice(-${limit});
-                  resolve({ bar_count: bars.length, last_bar: bars[bars.length - 1] || null });
-                }).catch(reject);
-            })
-          `);
+        } else if (action === 'get_ohlcv') {
+          // Read the series bars directly, the way data_get_ohlcv does.
+          // chartApi.exportData() rejects here, and the rejection reached the
+          // caller only as "JS evaluation error: Uncaught (in promise)".
+          const { success, last_5_bars, ...summary } = await getOhlcv({ count: ohlcv_count, summary: true });
+          actionResult = summary; // last_5_bars is dropped: one batch would carry N copies of it
         } else if (action === 'get_strategy_results') {
           await new Promise(r => setTimeout(r, 1000));
           actionResult = await evaluate(`
@@ -71,10 +88,12 @@ export async function batchRun({ symbols, timeframes, action, delay_ms, ohlcv_co
               return { metric_count: Object.keys(metrics).length, metrics: metrics };
             })()
           `);
-        } else {
-          actionResult = { error: 'Unknown action or API not available: ' + action };
         }
-        results.push({ ...combo, success: true, result: actionResult });
+
+        // An action that returns `{ error }` has not succeeded — counting it as
+        // one produced `successful: N, failed: 0` alongside N failed results.
+        if (actionResult && actionResult.error) results.push({ ...combo, success: false, error: actionResult.error });
+        else results.push({ ...combo, success: true, result: actionResult });
       } catch (err) {
         results.push({ ...combo, success: false, error: err.message });
       }
@@ -82,5 +101,11 @@ export async function batchRun({ symbols, timeframes, action, delay_ms, ohlcv_co
   }
 
   const successCount = results.filter(r => r.success).length;
-  return { success: true, total_iterations: results.length, successful: successCount, failed: results.length - successCount, results };
+  return {
+    success: successCount === results.length,
+    total_iterations: results.length,
+    successful: successCount,
+    failed: results.length - successCount,
+    results,
+  };
 }
