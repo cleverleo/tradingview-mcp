@@ -7,6 +7,13 @@ let targetInfo = null;
 // resolves to ::1 first, and Electron's --remote-debugging-port only listens on IPv4.
 export const CDP_HOST = process.env.TV_CDP_HOST || process.env.CDP_HOST || '127.0.0.1';
 export const CDP_PORT = Number(process.env.TV_CDP_PORT || process.env.CDP_PORT) || 9222;
+// Pin every connection to one specific page target, overridable via
+// TV_TARGET_ID. Without it findChartTarget() attaches to whichever chart
+// target /json/list happens to return first, which is ambiguous the moment a
+// second TradingView window is open: reads and writes would land in the
+// user's window instead of the scratch one. Get the id from window_list /
+// window_open / tab_list. An explicit connect(targetId) still wins over it.
+export const PINNED_TARGET_ID = process.env.TV_TARGET_ID || null;
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
 
@@ -68,11 +75,15 @@ export async function connect(targetId = null) {
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const target = targetId ? await findTargetById(targetId) : await findChartTarget();
+      const wantedId = targetId || PINNED_TARGET_ID;
+      const target = wantedId ? await findTargetById(wantedId) : await findChartTarget();
       if (!target) {
-        throw new Error(targetId
-          ? `CDP target ${targetId} not found — is the tab still open?`
-          : 'No TradingView chart target found. Is TradingView open with a chart?');
+        if (wantedId) {
+          throw new Error(targetId
+            ? `CDP target ${targetId} not found — is the tab still open?`
+            : `CDP target ${PINNED_TARGET_ID} from TV_TARGET_ID not found — is that window still open? Run window_list to see the open ones.`);
+        }
+        throw new Error('No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
       client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
