@@ -281,42 +281,79 @@ export async function setSource({ source }) {
   return { success: true, lines_set: source.split('\n').length };
 }
 
-export async function compile() {
-  const editorReady = await ensurePineEditorOpen();
+// ── "Add to chart" button finder (injected into TV page) ──
+//
+// The Pine editor header holds the script name, the apply button ("Add to
+// chart", which turns into "Update on chart" once the script is on the chart)
+// and "Save script". On a non-English UI the apply button has no text, only a
+// localized `title` (zh-CN: "添加到图表" / "图表更新"), and the web app keeps
+// those strings in webpack chunks keyed by module id rather than by English —
+// they are not in the desktop shell table that i18n.js reads. So the button is
+// found by position: the one other button beside Save. English labels are only
+// a fallback for when that anchor is missing.
+//
+// It never resolves to the Save button, and "Save and add to chart" is not
+// matched either: saving writes a script into the user's account, and a
+// compile must not quietly turn into that.
+//
+// Kept as a real function (stringified into the page) so it can be unit tested
+// against a stub document.
+export function findApplyButton(doc) {
+  var APPLY = /^(add to chart|update on chart)\b/i;
+  function visible(b) { return b.offsetParent !== null; }
+  function isSave(b) { return String(b.className).indexOf('saveButton') !== -1; }
+  function labels(b) {
+    return [b.textContent.trim(), b.getAttribute('title') || '', b.getAttribute('aria-label') || '']
+      .map(function(s) { return s.trim(); })
+      .filter(Boolean);
+  }
+  function hit(b, locator) { return { button: b, label: labels(b)[0] || '', locator: locator }; }
+  function isApply(b) { return !isSave(b) && labels(b).some(function(s) { return APPLY.test(s); }); }
+
+  var buttons = Array.prototype.filter.call(doc.querySelectorAll('button'), visible);
+  var save = buttons.filter(isSave)[0];
+  if (save && save.parentElement) {
+    var siblings = Array.prototype.filter.call(save.parentElement.children, function(c) {
+      return c.tagName === 'BUTTON' && !isSave(c) && visible(c);
+    });
+    var labelled = siblings.filter(isApply);
+    if (labelled.length === 1) return hit(labelled[0], 'editor_header');
+    if (siblings.length === 1) return hit(siblings[0], 'editor_header');
+  }
+  var byLabel = buttons.filter(isApply);
+  return byLabel.length ? hit(byLabel[0], 'english_label') : null;
+}
+
+const CLICK_APPLY_BUTTON = `
+  (function() {
+    var found = (${findApplyButton.toString()})(document);
+    if (!found) return null;
+    found.button.click();
+    return { label: found.label, locator: found.locator };
+  })()
+`;
+
+const APPLY_BUTTON_MISSING = 'Could not find the Pine Editor "Add to chart" / "Update on chart" button, so nothing was clicked. '
+  + 'Not falling back to the Save button: that would save a script into the account.';
+
+function resolveDeps(_deps) {
+  return {
+    ensureOpen: _deps?.ensurePineEditorOpen || ensurePineEditorOpen,
+    evaluate: _deps?.evaluate || evaluate,
+    sleep: _deps?.sleep || (ms => new Promise(r => setTimeout(r, ms))),
+  };
+}
+
+export async function compile({ _deps } = {}) {
+  const deps = resolveDeps(_deps);
+  const editorReady = await deps.ensureOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const clicked = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      var fallback = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
-        }
-        if (!fallback && /^(Add to chart|Update on chart)/i.test(text)) {
-          fallback = btns[i];
-        }
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) {
-          saveBtn = btns[i];
-        }
-      }
-      if (fallback) { fallback.click(); return fallback.textContent.trim(); }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
-      return null;
-    })()
-  `);
+  const clicked = await deps.evaluate(CLICK_APPLY_BUTTON);
+  if (!clicked) throw new Error(APPLY_BUTTON_MISSING);
 
-  if (!clicked) {
-    const c = await getClient();
-    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
-  }
-
-  await new Promise(r => setTimeout(r, 2000));
-  return { success: true, button_clicked: clicked || 'keyboard_shortcut', source: 'dom_fallback' };
+  await deps.sleep(2000);
+  return { success: true, button_clicked: clicked.label, button_locator: clicked.locator, source: 'dom_fallback' };
 }
 
 export async function getErrors() {
@@ -426,11 +463,12 @@ export async function getConsole() {
   return { success: true, entries: entries || [], entry_count: entries?.length || 0 };
 }
 
-export async function smartCompile() {
-  const editorReady = await ensurePineEditorOpen();
+export async function smartCompile({ _deps } = {}) {
+  const deps = resolveDeps(_deps);
+  const editorReady = await deps.ensureOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const studiesBefore = await evaluate(`
+  const studiesBefore = await deps.evaluate(`
     (function() {
       try {
         var chart = window.TradingViewApi._activeChartWidgetWV.value();
@@ -440,38 +478,12 @@ export async function smartCompile() {
     })()
   `);
 
-  const buttonClicked = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      var addBtn = null;
-      var updateBtn = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
-        }
-        if (!addBtn && /^add to chart$/i.test(text)) addBtn = btns[i];
-        if (!updateBtn && /^update on chart$/i.test(text)) updateBtn = btns[i];
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) saveBtn = btns[i];
-      }
-      if (addBtn) { addBtn.click(); return 'Add to chart'; }
-      if (updateBtn) { updateBtn.click(); return 'Update on chart'; }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
-      return null;
-    })()
-  `);
+  const clicked = await deps.evaluate(CLICK_APPLY_BUTTON);
+  if (!clicked) throw new Error(APPLY_BUTTON_MISSING);
 
-  if (!buttonClicked) {
-    const c = await getClient();
-    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
-  }
+  await deps.sleep(2500);
 
-  await new Promise(r => setTimeout(r, 2500));
-
-  const errors = await evaluate(`
+  const errors = await deps.evaluate(`
     (function() {
       var m = ${FIND_MONACO};
       if (!m) return [];
@@ -484,7 +496,7 @@ export async function smartCompile() {
     })()
   `);
 
-  const studiesAfter = await evaluate(`
+  const studiesAfter = await deps.evaluate(`
     (function() {
       try {
         var chart = window.TradingViewApi._activeChartWidgetWV.value();
@@ -498,7 +510,8 @@ export async function smartCompile() {
 
   return {
     success: true,
-    button_clicked: buttonClicked || 'keyboard_shortcut',
+    button_clicked: clicked.label,
+    button_locator: clicked.locator,
     has_errors: errors?.length > 0,
     errors: errors || [],
     study_added: studyAdded,
