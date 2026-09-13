@@ -85,7 +85,8 @@ Pinning is the `TV_TARGET_ID` env var on the server process. **With two windows 
 
 A window isolates the *interface*, not account content — layouts, watchlists, alerts and Pine scripts are account-level and shared by every window.
 
-- `window_list` → open windows, their tabs, and the target ids worth pinning to
+- `window_list` → open windows, their tabs, and the target ids worth pinning to; each page's `shell_target_id` is the window it is in
+- `tab_close` / `tab_switch` / `tab_new` act on the tab bar of the pinned page's window, and refuse rather than guess when that window can't be told apart. `tab_close` closes the pinned page itself, so pin the tab its window is showing; unpinned with several windows open, it refuses.
 
 ### "Manage layouts"
 - `layout_list` → saved layouts with both ids: `id` (numeric, for delete) and `chart_id` (the short one in the URL)

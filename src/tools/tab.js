@@ -23,12 +23,12 @@ export function registerTabTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('tab_close', 'Close the current chart tab', {}, async () => {
+  server.tool('tab_close', 'Close the current chart tab. With TV_TARGET_ID set, closes that page\'s tab, which must be the tab its window is showing; with several windows open, TV_TARGET_ID is required.', {}, async () => {
     try { return jsonResult(await core.closeTab()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('tab_switch', 'Switch to a chart tab by index', {
+  server.tool('tab_switch', 'Switch to a chart tab by index. With TV_TARGET_ID set, only switches within that page\'s window.', {
     index: z.coerce.number().describe('Tab index (0-based, from tab_list)'),
   }, async ({ index }) => {
     try { return jsonResult(await core.switchTab({ index })); }

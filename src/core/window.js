@@ -78,64 +78,144 @@ async function pageTargets(fetchFn) {
 
 const chartIdOf = (url = '') => url.match(/\/chart\/([^/?]+)/)?.[1] || null;
 
+// Which window a page is in can't be read off /json/list, and CDP's direct
+// answer, Browser.getWindowForTarget, isn't implemented by Electron ("wasn't
+// found", Desktop 3.4.1). But a window's shell and the page it shows report
+// the same outer window geometry — verified with three windows open, each
+// chart page matched its own shell on all four numbers (innerHeight differs
+// by the tab bar, so it is left out). Unverified: whether a hidden tab still
+// reports its window's geometry, which is why callers that click check
+// `page_visible` too.
+const BOUNDS_EXPR = '({ x: window.screenX, y: window.screenY, w: window.outerWidth, h: window.outerHeight })';
+
+function sameBounds(a, b) {
+  return !!a && !!b && ['x', 'y', 'w', 'h'].every((k) => Number.isFinite(a[k]) && a[k] === b[k]);
+}
+
+/**
+ * The shells that actually carry a tab bar, with their tabs and window bounds.
+ * Several targets share the shell URL (tooltip layers, helper views); the real
+ * tab bar is the one whose DOM actually has tabs.
+ */
+async function readTabBars(targets, attach) {
+  const shells = [];
+  for (const t of targets) {
+    if (kindOf(t.url) !== 'shell') continue;
+    let state = null;
+    try {
+      state = await attach(t.id, async ({ evalIn }) => ({
+        tabs: await evalIn(`
+          Array.prototype.map.call(document.querySelectorAll('${TAB_SELECTOR}'), function(e) {
+            return { title: (e.textContent || '').trim().slice(0, 60), active: e.classList.contains('active') };
+          })
+        `),
+        bounds: await evalIn(BOUNDS_EXPR),
+      }));
+    } catch { /* not reachable — treat as not a tab-bar shell */ }
+    if (Array.isArray(state?.tabs) && state.tabs.length) {
+      shells.push({ shell_target_id: t.id, tab_count: state.tabs.length, tabs: state.tabs, bounds: state.bounds });
+    }
+  }
+  return shells;
+}
+
+/** Visibility and window bounds of one page; nulls if it went away. */
+async function readPage(targetId, attach) {
+  try {
+    return await attach(targetId, async ({ evalIn }) => ({
+      visible: (await evalIn('document.visibilityState')) === 'visible',
+      bounds: await evalIn(BOUNDS_EXPR),
+    }));
+  } catch {
+    return { visible: false, bounds: null };
+  }
+}
+
+/** Tab-bar shells, each with its tab count, tabs and window bounds. */
+export async function tabBarShells({ _deps } = {}) {
+  const { fetchTargets: getTargets, withPage: attach } = resolve(_deps);
+  return readTabBars(await pageTargets(getTargets), attach);
+}
+
+/**
+ * Resolve the window a page lives in: its tab-bar shell, plus whether the
+ * page is the tab that window is showing. A shell id resolves to itself.
+ *
+ * Throws instead of guessing whenever the answer isn't exactly one window.
+ * The callers click in the shell this returns, and a wrong guess closes or
+ * switches a tab in a window the user is watching.
+ */
+export async function shellFor(targetId, { _deps } = {}) {
+  const { fetchTargets: getTargets, withPage: attach } = resolve(_deps);
+  const targets = await pageTargets(getTargets);
+  const page = targets.find((t) => t.id === targetId);
+  if (!page) {
+    throw new Error(`Target ${targetId} not found. Run window_list — it may already be closed.`);
+  }
+  const kind = kindOf(page.url);
+  if (kind === 'other') {
+    throw new Error(`Target ${targetId} is not a TradingView window or chart page (url: ${page.url}).`);
+  }
+
+  const shells = await readTabBars(targets, attach);
+
+  if (kind === 'shell') {
+    const own = shells.find((s) => s.shell_target_id === targetId);
+    if (!own) throw new Error(`Target ${targetId} is a shell view without a tab bar. Use a shell_target_id or page target_id from window_list.`);
+    return { shell_target_id: own.shell_target_id, tab_count: own.tab_count, page_kind: kind, page_visible: null };
+  }
+
+  const state = await readPage(targetId, attach);
+  const owners = shells.filter((s) => sameBounds(s.bounds, state.bounds));
+  if (owners.length > 1) {
+    throw new Error(`Can't tell which window page ${targetId} is in: ${owners.length} windows sit at exactly the same position and size. Move or resize one of them.`);
+  }
+  if (!owners.length) {
+    throw new Error(`Can't tell which window page ${targetId} is in: no tab bar matches its window bounds`
+      + (state.visible ? '.' : ' (it is not the tab its window is showing — switch to it, or pin the visible page from window_list).'));
+  }
+  return { shell_target_id: owners[0].shell_target_id, tab_count: owners[0].tab_count, page_kind: kind, page_visible: state.visible };
+}
+
 /**
  * List the open windows and every chart / layout-picker page behind them.
  *
  * A window's own tab bar lives in its shell target, so shells are what get
- * counted as windows. Which chart page belongs to which window can't be read
- * off the target list — but each window shows exactly one tab at a time, so
- * the pages marked `visible` are the current tab of some window, and those
- * are the ids worth pinning TV_TARGET_ID to.
+ * counted as windows. Each page carries the `shell_target_id` of the window
+ * it is in (matched by window bounds, see BOUNDS_EXPR; null when that match
+ * isn't unique). Each window shows exactly one tab at a time, so the pages
+ * marked `visible` are the current tab of some window, and those are the ids
+ * worth pinning TV_TARGET_ID to.
  */
 export async function list({ _deps } = {}) {
   const { fetchTargets: getTargets, withPage: attach } = resolve(_deps);
   const targets = await pageTargets(getTargets);
+  const shells = await readTabBars(targets, attach);
 
-  const windows = [];
   const pages = [];
-
   for (const t of targets) {
     const kind = kindOf(t.url);
+    if (kind === 'shell' || kind === 'other') continue;
 
-    if (kind === 'shell') {
-      // Several targets share the shell URL (tooltip layers, helper views);
-      // the real tab bar is the one whose DOM actually has tabs.
-      let tabs = null;
-      try {
-        tabs = await attach(t.id, ({ evalIn }) => evalIn(`
-          Array.prototype.map.call(document.querySelectorAll('${TAB_SELECTOR}'), function(e) {
-            return { title: (e.textContent || '').trim().slice(0, 60), active: e.classList.contains('active') };
-          })
-        `));
-      } catch { /* not reachable — treat as not a tab-bar shell */ }
-      if (Array.isArray(tabs) && tabs.length) {
-        windows.push({ shell_target_id: t.id, tab_count: tabs.length, tabs });
-      }
-      continue;
-    }
-
-    if (kind === 'other') continue;
-
-    let visibility = null;
-    try {
-      visibility = await attach(t.id, ({ evalIn }) => evalIn('document.visibilityState'));
-    } catch { /* target went away mid-listing */ }
+    const state = await readPage(t.id, attach);
+    const owners = shells.filter((s) => sameBounds(s.bounds, state.bounds));
 
     pages.push({
       target_id: t.id,
       kind,
-      visible: visibility === 'visible',
+      visible: state.visible,
+      shell_target_id: owners.length === 1 ? owners[0].shell_target_id : null,
       chart_id: chartIdOf(t.url),
       title: (t.title || '').replace(/^Live stock.*charts on /, '').slice(0, 60),
     });
   }
 
   return {
-    success: windows.length > 0,
-    window_count: windows.length,
-    windows,
+    success: shells.length > 0,
+    window_count: shells.length,
+    windows: shells.map((s) => ({ shell_target_id: s.shell_target_id, tab_count: s.tab_count, tabs: s.tabs })),
     pages,
-    note: 'Pin other tools to one of these pages with TV_TARGET_ID=<target_id>. A `visible` page is the tab its window currently shows.',
+    note: 'Pin other tools to one of these pages with TV_TARGET_ID=<target_id>. A `visible` page is the tab its window currently shows; `shell_target_id` is the window it is in. tab_close / tab_switch / tab_new act on the pinned page\'s window.',
   };
 }
 

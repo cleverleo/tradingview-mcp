@@ -5,7 +5,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { kindOf, list, open, close } from '../src/core/window.js';
+import { kindOf, list, open, close, shellFor } from '../src/core/window.js';
 
 const SHELL_URL = 'file:///Applications/TradingView.app/Contents/Resources/app.asar/app/window/index.html?x=1';
 const LANDING_URL = 'file:///Applications/TradingView.app/Contents/Resources/app.asar/app/new-tab/index.html';
@@ -93,6 +93,77 @@ describe('list', () => {
     const res = await list({ _deps: { fetchTargets: async () => [], withPage: mockWithPage({}) } });
     assert.equal(res.success, false);
     assert.equal(res.window_count, 0);
+  });
+});
+
+describe('which window a page is in', () => {
+  const at = (x, y) => ({ x, y, w: 1440, h: 843 });
+  const shell = (tabs, bounds) => ({ evalIn: evalBy({ '.tabs-container': tabs, 'window.screenX': bounds }) });
+  const view = (visibility, bounds) => ({ evalIn: evalBy({ visibilityState: visibility, 'window.screenX': bounds }) });
+  const one = [{ title: 'a', active: true }];
+  const two = [{ title: 'b', active: true }, { title: 'c', active: false }];
+
+  // Two windows plus a helper view that shares window 2's shell URL and bounds
+  // but has no tab bar — it must never count as an owner.
+  function world({ shell1At = at(0, 30), chart2 = view('visible', at(0, 64)) } = {}) {
+    const targets = [
+      page('shell1', SHELL_URL), page('shell2', SHELL_URL), page('helper', SHELL_URL),
+      page('chart1', CHART_URL), page('chart2', CHART_URL), page('tip', TOOLTIP_URL),
+    ];
+    const pages = {
+      shell1: shell(one, shell1At),
+      shell2: shell(two, at(0, 64)),
+      helper: shell([], at(0, 64)),
+      chart1: view('visible', at(0, 30)),
+      chart2,
+    };
+    return { fetchTargets: async () => targets, withPage: mockWithPage(pages) };
+  }
+
+  it('list tags each page with the shell of its window', async () => {
+    const res = await list({ _deps: world() });
+    const owner = Object.fromEntries(res.pages.map((p) => [p.target_id, p.shell_target_id]));
+    assert.deepEqual(owner, { chart1: 'shell1', chart2: 'shell2' });
+    assert.equal(res.windows[0].bounds, undefined);   // bounds are internal
+  });
+
+  it('list leaves shell_target_id null when two windows share the bounds', async () => {
+    const res = await list({ _deps: world({ shell1At: at(0, 64) }) });
+    assert.deepEqual(res.pages.map((p) => p.shell_target_id), [null, null]);
+  });
+
+  it('shellFor resolves a chart page to its window', async () => {
+    const res = await shellFor('chart2', { _deps: world() });
+    assert.deepEqual(res, { shell_target_id: 'shell2', tab_count: 2, page_kind: 'chart', page_visible: true });
+  });
+
+  it('shellFor resolves a shell id to itself', async () => {
+    const res = await shellFor('shell1', { _deps: world() });
+    assert.equal(res.shell_target_id, 'shell1');
+    assert.equal(res.page_visible, null);
+  });
+
+  it('shellFor flags a page that is not the tab its window shows', async () => {
+    const res = await shellFor('chart2', { _deps: world({ chart2: view('hidden', at(0, 64)) }) });
+    assert.equal(res.shell_target_id, 'shell2');
+    assert.equal(res.page_visible, false);
+  });
+
+  it('shellFor refuses to pick between windows at the same bounds', async () => {
+    await assert.rejects(shellFor('chart2', { _deps: world({ shell1At: at(0, 64) }) }), /same position and size/);
+  });
+
+  it('shellFor throws when no window matches, pointing at a hidden tab', async () => {
+    await assert.rejects(
+      shellFor('chart2', { _deps: world({ chart2: view('hidden', null) }) }),
+      /not the tab its window is showing/,
+    );
+  });
+
+  it('shellFor rejects unknown, non-TradingView and tab-less shell targets', async () => {
+    await assert.rejects(shellFor('nope', { _deps: world() }), /not found/);
+    await assert.rejects(shellFor('tip', { _deps: world() }), /not a TradingView window/);
+    await assert.rejects(shellFor('helper', { _deps: world() }), /without a tab bar/);
   });
 });
 

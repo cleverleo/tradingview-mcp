@@ -8,17 +8,64 @@
  * switching/creation/closing click the shell window's DOM directly:
  * `.tabs-container .tab`, its close button, and `create-new-tab-button`.
  * (Approach from issue #155 and PR #163, verified on Desktop 3.1.0.)
+ *
+ * Every window has its own shell, so "the" tab bar stops being one thing as
+ * soon as a second window is open. Tab operations pick their shell once, in
+ * pickShell(): the window the TV_TARGET_ID page lives in when that is set,
+ * otherwise the first tab bar there is.
  */
 import CDP from 'chrome-remote-interface';
 import { labelsFor } from './i18n.js';
+import { shellFor, tabBarShells } from './window.js';
 import { getClient, reconnectTo, CDP_HOST, CDP_PORT, PINNED_TARGET_ID } from '../connection.js';
+
+const TAB_COUNT = `document.querySelectorAll('.tabs-container .tab').length`;
+const LANDING_RE = /\/app\/new-tab\//i;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchTargets() {
+  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  return resp.json();
+}
+
+/** Run fn with an eval helper attached to a specific target. */
+async function withTarget(targetId, fn) {
+  let c = null;
+  try {
+    c = await CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId });
+    return await fn(async (expression) => {
+      const { result } = await c.Runtime.evaluate({ expression, returnByValue: true });
+      return result?.value;
+    });
+  } finally {
+    try { if (c) await c.close(); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Test seams, same shape as window.js's (`fetchTargets`, `withPage`) so one
+ * `_deps` object drives both modules. The tools and the CLI never pass it.
+ */
+function resolve(deps) {
+  return {
+    fetchTargets: deps?.fetchTargets || fetchTargets,
+    attach: deps?.withPage
+      ? (id, fn) => deps.withPage(id, ({ evalIn }) => fn(evalIn))
+      : withTarget,
+    pinned: deps && 'pinnedTargetId' in deps ? deps.pinnedTargetId : PINNED_TARGET_ID,
+    sleep: deps?.sleep || sleep,
+    getClient: deps?.getClient || getClient,
+    reconnectTo: deps?.reconnectTo || reconnectTo,
+  };
+}
 
 /**
  * List all open chart tabs (CDP page targets).
  */
-export async function list() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+export async function list({ _deps } = {}) {
+  const { fetchTargets: getTargets } = resolve(_deps);
+  const targets = await getTargets();
 
   // Chart tabs plus new-tab landing pages (layout picker), so every tab in the
   // top bar is listable and switchable.
@@ -37,52 +84,50 @@ export async function list() {
 }
 
 /**
- * Run fn with a CDP client attached to the Electron shell window that owns
- * the tab bar. There can be several app/window/index.html targets; the shell
- * is the one whose DOM actually contains `.tabs-container .tab`.
+ * Choose the tab-bar shell a tab operation clicks in. Called once per
+ * operation, and every step after it (count, click, recount) runs against
+ * the shell it returns — re-picking from /json/list between steps is how the
+ * last-tab guard once passed on a 2-tab window while the click landed in a
+ * 1-tab one.
+ *
+ * With TV_TARGET_ID set this is the window that page lives in; shellFor()
+ * throws rather than guess when that can't be pinned to exactly one window.
+ * Without it, the first tab bar found — only unambiguous with one window
+ * open, so `window_count` goes back to the caller to decide.
  */
-async function withShell(fn) {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
-  const candidates = targets.filter(t => t.type === 'page' && /\/window\/index\.html/i.test(t.url || ''));
-
-  for (const cand of candidates) {
-    let c = null;
-    try {
-      c = await CDP({ host: CDP_HOST, port: CDP_PORT, target: cand.id });
-      const probe = await c.Runtime.evaluate({
-        expression: `!!document.querySelector('.tabs-container .tab')`,
-        returnByValue: true,
-      });
-      if (probe.result?.value) {
-        const out = await fn(async (expression) => {
-          const { result } = await c.Runtime.evaluate({ expression, returnByValue: true });
-          return result?.value;
-        });
-        await c.close();
-        return out;
-      }
-      await c.close();
-    } catch {
-      try { if (c) await c.close(); } catch { /* already gone */ }
-    }
+async function pickShell(deps) {
+  const { pinned } = resolve(deps);
+  if (pinned) {
+    return { ...(await shellFor(pinned, { _deps: deps })), pinned, window_count: null };
   }
-  throw new Error('TradingView shell window (tab bar) not found. Is this TradingView Desktop with tabs?');
+  const shells = await tabBarShells({ _deps: deps });
+  if (!shells.length) {
+    throw new Error('TradingView shell window (tab bar) not found. Is this TradingView Desktop with tabs?');
+  }
+  return { ...shells[0], page_kind: null, page_visible: null, pinned: null, window_count: shells.length };
+}
+
+/** Whether two page targets belong to the same window; false when unsure. */
+async function sameWindow(a, b, deps) {
+  try {
+    const [ownerA, ownerB] = [await shellFor(a, { _deps: deps }), await shellFor(b, { _deps: deps })];
+    return ownerA.shell_target_id === ownerB.shell_target_id;
+  } catch {
+    return false;
+  }
 }
 
 /** Check whether a CDP page target is the visible one. */
-async function isTargetVisible(targetId) {
-  let c = null;
+async function isTargetVisible(attach, targetId) {
   try {
-    c = await CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId });
-    const { result } = await c.Runtime.evaluate({ expression: 'document.visibilityState', returnByValue: true });
-    return result?.value === 'visible';
+    return (await attach(targetId, (evalIn) => evalIn('document.visibilityState'))) === 'visible';
   } catch {
     return false;
-  } finally {
-    try { if (c) await c.close(); } catch { /* already gone */ }
   }
 }
+
+const isLanding = (t) => t.type === 'page'
+  && (LANDING_RE.test(t.url || '') || t.title === 'New tab');
 
 /**
  * Find an open new-tab landing page target (shows the layout picker).
@@ -92,34 +137,18 @@ async function isTargetVisible(targetId) {
  * which is exactly what window_open hands back — settles it; the scan is the
  * fallback for the single-window case.
  */
-export async function findLandingTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+export async function findLandingTarget({ _deps } = {}) {
+  const { fetchTargets: getTargets, pinned } = resolve(_deps);
+  const targets = await getTargets();
   // Match on the landing page's URL, not its title: the title is localized
   // (zh: "新标签页"), so a title comparison only ever works in English.
-  const isLanding = (t) => t.type === 'page'
-    && (/\/app\/new-tab\//i.test(t.url || '') || t.title === 'New tab');
-  if (PINNED_TARGET_ID) {
-    const pinned = targets.find(t => t.id === PINNED_TARGET_ID && isLanding(t));
-    if (pinned) return pinned;
+  if (pinned) {
+    const hit = targets.find(t => t.id === pinned && isLanding(t));
+    if (hit) return hit;
   }
-  return targets.find(t => t.type === 'page' && /\/app\/new-tab\//i.test(t.url || ''))
+  return targets.find(t => t.type === 'page' && LANDING_RE.test(t.url || ''))
     || targets.find(t => t.type === 'page' && t.title === 'New tab')
     || null;
-}
-
-/** Run fn with an eval helper attached to a specific target. */
-async function withTarget(targetId, fn) {
-  let c = null;
-  try {
-    c = await CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId });
-    return await fn(async (expression) => {
-      const { result } = await c.Runtime.evaluate({ expression, returnByValue: true });
-      return result?.value;
-    });
-  } finally {
-    try { if (c) await c.close(); } catch { /* already gone */ }
-  }
 }
 
 /**
@@ -129,13 +158,23 @@ async function withTarget(targetId, fn) {
  *   layout: '<name>' -> open the saved layout whose title contains <name>
  * Reuses an already-open landing tab instead of opening another one.
  */
-export async function newTab({ layout, name } = {}) {
-  let landing = await findLandingTarget();
+export async function newTab({ layout, name, _deps } = {}) {
+  const { fetchTargets: getTargets, attach, pinned, sleep: wait, reconnectTo: follow } = resolve(_deps);
+  let landing = await findLandingTarget({ _deps });
   let shellCounts = null;
 
+  // Pinned to something other than a picker (a chart page, say), the scan can
+  // turn up a picker in some other window. Reusing it would put the layout
+  // there, so only take it when it is provably in the pinned page's window.
+  if (landing && pinned && landing.id !== pinned && !(await sameWindow(pinned, landing.id, _deps))) {
+    landing = null;
+  }
+
   if (!landing) {
-    shellCounts = await withShell(async (evalIn) => {
-      const before = await evalIn(`document.querySelectorAll('.tabs-container .tab').length`);
+    const shell = await pickShell(_deps);
+    const idsBefore = new Set((await getTargets()).map(t => t.id));
+    shellCounts = await attach(shell.shell_target_id, async (evalIn) => {
+      const before = await evalIn(TAB_COUNT);
       const clicked = await evalIn(`
         (function() {
           // The real button (.create-new-tab-button) has to be tried first:
@@ -150,15 +189,18 @@ export async function newTab({ layout, name } = {}) {
         })()
       `);
       if (!clicked) throw new Error('New-tab button not found in shell window.');
-      await new Promise(r => setTimeout(r, 1500));
-      const after = await evalIn(`document.querySelectorAll('.tabs-container .tab').length`);
+      await wait(1500);
+      const after = await evalIn(TAB_COUNT);
       return { before, after };
     });
-    landing = await findLandingTarget();
+    // The picker this click opened is the one that wasn't there before it.
+    // A rescan would take whichever picker lists first, in any window.
+    landing = (await getTargets()).find(t => !idsBefore.has(t.id) && isLanding(t))
+      || (pinned ? null : await findLandingTarget({ _deps }));
   }
 
   if (!layout) {
-    const state = await list();
+    const state = await list({ _deps });
     return {
       success: shellCounts ? shellCounts.after > shellCounts.before : !!landing,
       action: 'new_tab_opened',
@@ -171,16 +213,15 @@ export async function newTab({ layout, name } = {}) {
   if (!landing) throw new Error('New tab opened but its landing page target was not found.');
 
   // Snapshot existing chart targets so we can spot the one the pick creates.
-  const beforeResp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
   const chartIdsBefore = new Set(
-    (await beforeResp.json())
+    (await getTargets())
       .filter(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
       .map(t => t.id)
   );
 
   const wantNew = String(layout).trim().toLowerCase() === 'new';
   const layoutName = name || 'New layout';
-  const picked = await withTarget(landing.id, async (evalIn) => {
+  const picked = await attach(landing.id, async (evalIn) => {
     if (wantNew) {
       // The landing page renders in the app's language, so the name field's
       // placeholder and the Create button's text are both translated. Resolve
@@ -193,7 +234,7 @@ export async function newTab({ layout, name } = {}) {
       // disabled until the name input is filled (React controlled input, so
       // the native value setter + input event are required).
       await evalIn(`(function(){ var b = document.querySelector('.create-new-layout-button'); if (b) b.click(); })()`);
-      await new Promise(r => setTimeout(r, 700));
+      await wait(700);
       const filled = await evalIn(`
         (function() {
           // The dialog's name field, not the landing page's Search box. This
@@ -213,7 +254,7 @@ export async function newTab({ layout, name } = {}) {
         })()
       `);
       if (filled !== 'filled') throw new Error(`Create-layout dialog did not open as expected (${filled}).`);
-      await new Promise(r => setTimeout(r, 400));
+      await wait(400);
       const created = await evalIn(`
         (function() {
           var wanted = ${JSON.stringify(createLabels)};
@@ -246,7 +287,7 @@ export async function newTab({ layout, name } = {}) {
     if (!foundTitle) {
       // Not in the recents — expand the full layout list and retry.
       await evalIn(`(function(){ var b = document.querySelector('.layout-list-expand-button'); if (b) b.click(); })()`);
-      await new Promise(r => setTimeout(r, 800));
+      await wait(800);
       foundTitle = await evalIn(clickByTitle);
     }
     return foundTitle;
@@ -259,9 +300,8 @@ export async function newTab({ layout, name } = {}) {
   // Wait for a chart target that wasn't there before the pick.
   let chartTarget = null;
   for (let i = 0; i < 30; i++) {
-    await new Promise(r => setTimeout(r, 500));
-    const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-    const targets = await resp.json();
+    await wait(500);
+    const targets = await getTargets();
     chartTarget = targets.find(x =>
       x.type === 'page' && /tradingview\.com\/chart/i.test(x.url) && !chartIdsBefore.has(x.id)
     ) || targets.find(x => x.id === landing.id && /tradingview\.com\/chart/i.test(x.url)) || null;
@@ -270,8 +310,8 @@ export async function newTab({ layout, name } = {}) {
   if (!chartTarget) throw new Error(`Picked "${picked}" but no new chart target appeared.`);
 
   // Give the chart a moment to boot, then follow it.
-  await new Promise(r => setTimeout(r, 2000));
-  await reconnectTo(chartTarget.id);
+  await wait(2000);
+  await follow(chartTarget.id);
   // The landing page navigated to a chart, which swapped renderer processes:
   // the target id the caller pinned is gone and this is its replacement. Hand
   // it back so the next call can pin to it without re-listing the windows.
@@ -286,18 +326,35 @@ export async function newTab({ layout, name } = {}) {
 }
 
 /**
- * Close the currently active tab by clicking its close button in the shell.
+ * Close the active tab of one window by clicking its close button in the shell.
+ *
+ * Which window: the TV_TARGET_ID page's, and that page has to be the tab its
+ * window is showing — so the tab that closes is the pinned one, never a
+ * neighbour. Unpinned, only while a single window is open: with several, the
+ * tab that goes would be in whichever window /json/list happens to list first.
  */
-export async function closeTab() {
-  const before = await withShell((evalIn) => evalIn(`document.querySelectorAll('.tabs-container .tab').length`));
-  if (before <= 1) {
-    throw new Error('Cannot close the last tab. Use tv_launch to restart TradingView instead.');
+export async function closeTab({ _deps } = {}) {
+  const { fetchTargets: getTargets, attach, sleep: wait, getClient: refresh } = resolve(_deps);
+  const shell = await pickShell(_deps);
+  const closesPinnedPage = !!shell.pinned && shell.page_kind !== 'shell';
+
+  if (closesPinnedPage && !shell.page_visible) {
+    throw new Error(`The TV_TARGET_ID page (${shell.pinned}) is not the tab its window is showing, and tab_close closes the showing tab. Switch to it first, or pin the visible page from window_list.`);
+  }
+  if (!shell.pinned && shell.window_count > 1) {
+    throw new Error(`${shell.window_count} TradingView windows are open and TV_TARGET_ID is not set, so there is no telling which window would lose a tab. Pin a page from window_list.`);
   }
 
-  const result = await withShell(async (evalIn) => {
+  // Guard, click and recount on one client, in the shell picked above.
+  const { before, after } = await attach(shell.shell_target_id, async (evalIn) => {
+    const count = await evalIn(TAB_COUNT);
+    if (!(count > 1)) {
+      throw new Error('Cannot close the last tab. Use tv_launch to restart TradingView instead.');
+    }
     const clicked = await evalIn(`
       (function() {
-        var active = document.querySelector('.tabs-container .tab.active') || document.querySelectorAll('.tabs-container .tab')[0];
+        // Pinned, only the active tab will do: it is the pinned page's tab.
+        var active = document.querySelector('.tabs-container .tab.active')${shell.pinned ? '' : ` || document.querySelectorAll('.tabs-container .tab')[0]`};
         if (!active) return false;
         // The close container div has no handler — the real clickable is the button inside it.
         var close = active.querySelector('[class*="close"] button') || active.querySelector('button[class*="close"]') || active.querySelector('[class*="close"]');
@@ -307,14 +364,41 @@ export async function closeTab() {
       })()
     `);
     if (!clicked) throw new Error('Close button not found on the active tab.');
-    await new Promise(r => setTimeout(r, 1000));
-    return evalIn(`document.querySelectorAll('.tabs-container .tab').length`);
+    await wait(1000);
+    return { before: count, after: await evalIn(TAB_COUNT) };
   });
 
-  // Our cached CDP client may have been attached to the closed tab — re-resolve.
-  try { await getClient(); } catch { /* next tool call will reconnect */ }
+  const result = {
+    success: after < before,
+    action: 'tab_closed',
+    shell_target_id: shell.shell_target_id,
+    tabs_before: before,
+    tabs_after: after,
+  };
 
-  return { success: result < before, action: 'tab_closed', tabs_before: before, tabs_after: result };
+  if (closesPinnedPage) {
+    // Confirm the tab that went is the pinned page. The tab count drops
+    // before the page target is torn down, so give it a moment.
+    let gone = false;
+    for (let i = 0; i < 5 && !gone; i++) {
+      gone = !(await getTargets()).some(t => t.id === shell.pinned);
+      if (!gone) await wait(400);
+    }
+    result.closed_target_id = shell.pinned;
+    result.pinned_page_closed = gone;
+    if (!gone) {
+      result.success = false;
+      result.error = `A tab closed, but the TV_TARGET_ID page (${shell.pinned}) is still open. Check window_list.`;
+    } else {
+      result.note = 'TV_TARGET_ID pointed at the tab that just closed. Re-pin from window_list before the next call.';
+    }
+  } else if (!shell.pinned) {
+    // Our cached CDP client may have been attached to the closed tab — re-resolve.
+    // (Pinned, connect() only ever goes back to the pin, so there is nothing to re-resolve.)
+    try { await refresh(); } catch { /* next tool call will reconnect */ }
+  }
+
+  return result;
 }
 
 /**
@@ -322,9 +406,12 @@ export async function closeTab() {
  * tab in the shell window so the switch is visible, verifies the desired
  * chart target actually became visible, then re-attaches the CDP client so
  * subsequent reads follow it.
+ *
+ * With TV_TARGET_ID set, the clicking happens only in that page's window.
  */
-export async function switchTab({ index }) {
-  const tabs = await list();
+export async function switchTab({ index, _deps } = {}) {
+  const { attach, sleep: wait, reconnectTo: follow } = resolve(_deps);
+  const tabs = await list({ _deps });
   const idx = Number(index);
 
   if (idx >= tabs.tab_count) {
@@ -333,26 +420,28 @@ export async function switchTab({ index }) {
 
   const target = tabs.tabs[idx];
 
-  if (!(await isTargetVisible(target.id))) {
-    const clicked = await withShell(async (evalIn) => {
-      const count = await evalIn(`document.querySelectorAll('.tabs-container .tab').length`);
+  if (!(await isTargetVisible(attach, target.id))) {
+    const shell = await pickShell(_deps);
+    const clicked = await attach(shell.shell_target_id, async (evalIn) => {
+      const count = await evalIn(TAB_COUNT);
       // Try the same ordinal first (shell order usually matches), then the rest.
       const order = [...new Set([Math.min(idx, count - 1), ...Array.from({ length: count }, (_, k) => k)])];
       for (const k of order) {
         await evalIn(`document.querySelectorAll('.tabs-container .tab')[${k}].click()`);
-        await new Promise(r => setTimeout(r, 400));
-        if (await isTargetVisible(target.id)) return k;
+        await wait(400);
+        if (await isTargetVisible(attach, target.id)) return k;
       }
       return null;
     });
     if (clicked === null) {
-      throw new Error(`Clicked through all shell tabs but chart ${target.chart_id} never became visible.`);
+      throw new Error(`Clicked through all shell tabs but chart ${target.chart_id} never became visible.`
+        + (shell.pinned ? ` With TV_TARGET_ID set, tab_switch only switches within that page's window (${shell.shell_target_id}).` : ''));
     }
   }
 
   // Re-attach the cached CDP client so subsequent reads follow the switch.
   try {
-    await reconnectTo(target.id);
+    await follow(target.id);
   } catch (e) {
     throw new Error(`Tab is visible but failed to re-attach CDP to it: ${e.message}`);
   }
